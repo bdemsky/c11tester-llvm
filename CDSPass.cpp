@@ -533,12 +533,12 @@ bool CDSPass::runOnFunction(Function &F) {
 					chooseInstructionsToInstrument(LocalLoadsAndStores, AllLoadsAndStores,
 						DL);
 				}
-			} else if (isAtomicCall(&Inst) ) {
+			} /*else if (isAtomicCall(&Inst) ) {
 				AtomicAccesses.push_back(&Inst);
 				HasAtomic = true;
 				chooseInstructionsToInstrument(LocalLoadsAndStores, AllLoadsAndStores,
 					DL);
-			} else if (isa<LoadInst>(Inst) || isa<StoreInst>(Inst)) {
+			}*/ else if (isa<LoadInst>(Inst) || isa<StoreInst>(Inst)) {
 				LoadInst *LI = dyn_cast<LoadInst>(&Inst);
 				StoreInst *SI = dyn_cast<StoreInst>(&Inst);
 				bool isVolatile = ( LI ? LI->isVolatile() : SI->isVolatile() );
@@ -722,12 +722,14 @@ bool CDSPass::instrumentMemIntrinsic(Instruction *I) {
 
 bool CDSPass::instrumentAtomic(Instruction * I, const DataLayout &DL) {
 	IRBuilder<> IRB(I);
+	Value *position = getPosition(I, IRB);
 
+/*
 	if (auto *CI = dyn_cast<CallInst>(I)) {
 		return instrumentAtomicCall(CI, DL);
 	}
+*/
 
-	Value *position = getPosition(I, IRB);
 	if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
 		Value *Addr = LI->getPointerOperand();
 		int Idx=getMemoryAccessFuncIndex(Addr, DL);
