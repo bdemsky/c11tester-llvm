@@ -190,16 +190,13 @@ namespace {
 		bool instrumentLoadOrStore(Instruction *I, const DataLayout &DL);
 		bool instrumentVolatile(Instruction *I, const DataLayout &DL);
 		bool instrumentMemIntrinsic(Instruction *I);
-		bool isAtomicCall(Instruction *I);
 		bool instrumentAtomic(Instruction *I, const DataLayout &DL);
-		bool instrumentAtomicCall(CallInst *CI, const DataLayout &DL);
 		bool shouldInstrumentBeforeAtomics(Instruction *I);
 		void chooseInstructionsToInstrument(SmallVectorImpl<Instruction *> &Local,
 											SmallVectorImpl<Instruction *> &All,
 											const DataLayout &DL);
 		bool addrPointsToConstantData(Value *Addr);
 		int getMemoryAccessFuncIndex(Value *Addr, const DataLayout &DL);
-		bool instrumentLoops(Function &F);
 
 		Function * CDSFuncEntry;
 		Function * CDSFuncExit;
@@ -521,8 +518,6 @@ bool CDSPass::runOnFunction(Function &F) {
 	bool HasVolatile = false;
 	const DataLayout &DL = F.getParent()->getDataLayout();
 
-	// instrumentLoops(F);
-
 	for (auto &BB : F) {
 		for (auto &Inst : BB) {
 			if ( (&Inst)->isAtomic() ) {
@@ -533,12 +528,7 @@ bool CDSPass::runOnFunction(Function &F) {
 					chooseInstructionsToInstrument(LocalLoadsAndStores, AllLoadsAndStores,
 						DL);
 				}
-			} /*else if (isAtomicCall(&Inst) ) {
-				AtomicAccesses.push_back(&Inst);
-				HasAtomic = true;
-				chooseInstructionsToInstrument(LocalLoadsAndStores, AllLoadsAndStores,
-					DL);
-			}*/ else if (isa<LoadInst>(Inst) || isa<StoreInst>(Inst)) {
+			} else if (isa<LoadInst>(Inst) || isa<StoreInst>(Inst)) {
 				LoadInst *LI = dyn_cast<LoadInst>(&Inst);
 				StoreInst *SI = dyn_cast<StoreInst>(&Inst);
 				bool isVolatile = ( LI ? LI->isVolatile() : SI->isVolatile() );
@@ -724,12 +714,6 @@ bool CDSPass::instrumentAtomic(Instruction * I, const DataLayout &DL) {
 	IRBuilder<> IRB(I);
 	Value *position = getPosition(I, IRB);
 
-/*
-	if (auto *CI = dyn_cast<CallInst>(I)) {
-		return instrumentAtomicCall(CI, DL);
-	}
-*/
-
 	if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
 		Value *Addr = LI->getPointerOperand();
 		int Idx=getMemoryAccessFuncIndex(Addr, DL);
@@ -818,342 +802,6 @@ bool CDSPass::instrumentAtomic(Instruction * I, const DataLayout &DL) {
 	return true;
 }
 
-bool CDSPass::isAtomicCall(Instruction *I) {
-	if ( auto *CI = dyn_cast<CallInst>(I) ) {
-		Function *fun = CI->getCalledFunction();
-		if (fun == NULL)
-			return false;
-
-		StringRef funName = fun->getName();
-
-		// TODO: come up with better rules for function name checking
-		for (StringRef name : AtomicFuncNames) {
-			if ( funName.contains(name) ) 
-				return true;
-		}
-		
-		for (StringRef PartialName : PartialAtomicFuncNames) {
-			if (funName.contains(PartialName) && 
-					funName.contains("atomic") )
-				return true;
-		}
-	}
-
-	return false;
-}
-
-bool CDSPass::instrumentAtomicCall(CallInst *CI, const DataLayout &DL) {
-	IRBuilder<> IRB(CI);
-	Function *fun = CI->getCalledFunction();
-	StringRef funName = fun->getName();
-	std::vector<Value *> parameters;
-
-	User::op_iterator begin = CI->arg_begin();
-	User::op_iterator end = CI->arg_end();
-	for (User::op_iterator it = begin; it != end; ++it) {
-		Value *param = *it;
-		parameters.push_back(param);
-	}
-
-	// obtain source line number of the CallInst
-	Value *position = getPosition(CI, IRB);
-
-	// the pointer to the address is always the first argument
-	Value *OrigPtr = parameters[0];
-
-	int Idx = getMemoryAccessFuncIndex(OrigPtr, DL);
-	if (Idx < 0)
-		return false;
-
-	const unsigned ByteSize = 1U << Idx;
-	const unsigned BitSize = ByteSize * 8;
-	Type *Ty = Type::getIntNTy(IRB.getContext(), BitSize);
-	Type *PtrTy = Ty->getPointerTo();
-
-	// atomic_init; args = {obj, order}
-	if (funName.contains("atomic_init")) {
-		Value *OrigVal = parameters[1];
-
-		Value *ptr = IRB.CreatePointerCast(OrigPtr, PtrTy);
-		Value *val;
-		if (OrigVal->getType()->isPtrOrPtrVectorTy())
-			val = IRB.CreatePointerCast(OrigVal, Ty);
-		else
-			val = IRB.CreateIntCast(OrigVal, Ty, true);
-
-		Value *args[] = {ptr, val, position};
-
-		if (!checkSignature(CDSAtomicInit[Idx], args))
-			return false;
-
-		Instruction* funcInst = CallInst::Create(CDSAtomicInit[Idx], args);
-		ReplaceInstWithInst(CI, funcInst);
-		return true;
-	}
-
-	// atomic_load; args = {obj, order}
-	if (funName.contains("atomic_load")) {
-		bool isExplicit = funName.contains("atomic_load_explicit");
-
-		Value *ptr = IRB.CreatePointerCast(OrigPtr, PtrTy);
-		Value *order;
-		if (isExplicit)
-			order = IRB.CreateBitOrPointerCast(parameters[1], OrdTy);
-		else 
-			order = ConstantInt::get(OrdTy, 
-							(int) AtomicOrderingCABI::seq_cst);
-		Value *args[] = {ptr, order, position};
-
-		if (!checkSignature(CDSAtomicLoad[Idx], args))
-			return false;
-
-		Instruction* funcInst = CallInst::Create(CDSAtomicLoad[Idx], args);
-		ReplaceInstWithInst(CI, funcInst);
-
-		return true;
-	} else if (funName.contains("atomic") && 
-					funName.contains("load") ) {
-		// does this version of call always have an atomic order as an argument?
-		Value *ptr = IRB.CreatePointerCast(OrigPtr, PtrTy);
-		Value *order = IRB.CreateBitOrPointerCast(parameters[1], OrdTy);
-		Value *args[] = {ptr, order, position};
-
-		// Without this check, gdax does not compile :(
-		if (!CI->getType()->isPointerTy()) {
-			return false;	
-		} 
-
-		if (!checkSignature(CDSAtomicLoad[Idx], args))
-			return false;
-
-		CallInst *funcInst = IRB.CreateCall(CDSAtomicLoad[Idx], args);
-		Value *RetVal = IRB.CreateIntToPtr(funcInst, CI->getType());
-
-		CI->replaceAllUsesWith(RetVal);
-		CI->eraseFromParent();
-
-		return true;
-	}
-
-	// atomic_store; args = {obj, val, order}
-	if (funName.contains("atomic_store")) {
-		bool isExplicit = funName.contains("atomic_store_explicit");
-		Value *OrigVal = parameters[1];
-
-		Value *ptr = IRB.CreatePointerCast(OrigPtr, PtrTy);
-		Value *val = IRB.CreatePointerCast(OrigVal, Ty);
-		Value *order;
-		if (isExplicit)
-			order = IRB.CreateBitOrPointerCast(parameters[2], OrdTy);
-		else 
-			order = ConstantInt::get(OrdTy, 
-							(int) AtomicOrderingCABI::seq_cst);
-		Value *args[] = {ptr, val, order, position};
-
-		if (!checkSignature(CDSAtomicStore[Idx], args))
-			return false;
-
-		Instruction* funcInst = CallInst::Create(CDSAtomicStore[Idx], args);
-		ReplaceInstWithInst(CI, funcInst);
-
-		return true;
-	} else if (funName.contains("atomic") && 
-					funName.contains("store") ) {
-		// Does this version of call always have an atomic order as an argument?
-		if (parameters.size() < 3)
-			return false;
-
-		Value *OrigVal = parameters[1];
-		Value *ptr = IRB.CreatePointerCast(OrigPtr, PtrTy);
-
-		Value *val;
-		if (OrigVal->getType()->isPtrOrPtrVectorTy())
-			val = IRB.CreatePointerCast(OrigVal, Ty);
-		else
-			val = IRB.CreateIntCast(OrigVal, Ty, true);
-
-		Value *order = IRB.CreateBitOrPointerCast(parameters[2], OrdTy);
-		Value *args[] = {ptr, val, order, position};
-
-		if (!checkSignature(CDSAtomicStore[Idx], args))
-			return false;
-
-		Instruction* funcInst = CallInst::Create(CDSAtomicStore[Idx], args);
-		ReplaceInstWithInst(CI, funcInst);
-
-		return true;
-	}
-
-	// atomic_fetch_*; args = {obj, val, order}
-	if (funName.contains("atomic_fetch_") || 
-		funName.contains("atomic_exchange")) {
-
-		bool isExplicit = funName.contains("_explicit");
-		Value *OrigVal = parameters[1];
-
-		int op;
-		if ( funName.contains("_fetch_add") )
-			op = AtomicRMWInst::Add;
-		else if ( funName.contains("_fetch_sub") )
-			op = AtomicRMWInst::Sub;
-		else if ( funName.contains("_fetch_and") )
-			op = AtomicRMWInst::And;
-		else if ( funName.contains("_fetch_or") )
-			op = AtomicRMWInst::Or;
-		else if ( funName.contains("_fetch_xor") )
-			op = AtomicRMWInst::Xor;
-		else if ( funName.contains("atomic_exchange") )
-			op = AtomicRMWInst::Xchg;
-		else {
-			errs() << "Unknown atomic read-modify-write operation\n";
-			return false;
-		}
-
-		Value *ptr = IRB.CreatePointerCast(OrigPtr, PtrTy);
-		Value *val;
-		if (OrigVal->getType()->isPtrOrPtrVectorTy())
-			val = IRB.CreatePointerCast(OrigVal, Ty);
-		else
-			val = IRB.CreateIntCast(OrigVal, Ty, true);
-
-		Value *order;
-		if (isExplicit)
-			order = IRB.CreateBitOrPointerCast(parameters[2], OrdTy);
-		else 
-			order = ConstantInt::get(OrdTy, 
-							(int) AtomicOrderingCABI::seq_cst);
-		Value *args[] = {ptr, val, order, position};
-
-		if (!checkSignature(CDSAtomicRMW[op][Idx], args))
-			return false;
-
-		Instruction* funcInst = CallInst::Create(CDSAtomicRMW[op][Idx], args);
-		ReplaceInstWithInst(CI, funcInst);
-
-		return true;
-	} else if (funName.contains("fetch")) {
-		errs() << "atomic fetch captured. Not implemented yet. ";
-		errs() << "See source file :";
-		getPosition(CI, IRB, true);
-		return false;
-	} else if (funName.contains("exchange") &&
-			!funName.contains("compare_exchange") ) {
-		if (CI->getType()->isPointerTy()) {
-			/**
-			 * TODO: instrument the following case
-			 * mcs-lock.h
-			 * std::atomic<struct T *> m_tail;
-			 * struct T * me;
-			 * struct T * pred = m_tail.exchange(me, memory_order_*);
-			 */
-			errs() << "atomic exchange captured. Not implemented yet. ";
-			errs() << "See source file :";
-			getPosition(CI, IRB, true);
-
-			return false;
-		}
-
-		Value *OrigVal = parameters[1];
-
-		Value *ptr = IRB.CreatePointerCast(OrigPtr, PtrTy);
-		Value *val;
-		if (OrigVal->getType()->isPtrOrPtrVectorTy())
-			val = IRB.CreatePointerCast(OrigVal, Ty);
-		else
-			val = IRB.CreateIntCast(OrigVal, Ty, true);
-
-		Value *order = IRB.CreateBitOrPointerCast(parameters[2], OrdTy);
-		Value *args[] = {ptr, val, order, position};
-
-		int op = AtomicRMWInst::Xchg;
-
-		if (!checkSignature(CDSAtomicRMW[op][Idx], args))
-			return false;
-
-		Instruction* funcInst = CallInst::Create(CDSAtomicRMW[op][Idx], args);
-		ReplaceInstWithInst(CI, funcInst);
-
-		return true;
-	}
-
-	/* atomic_compare_exchange_*; 
-	   args = {obj, expected, new value, order1, order2}
-	*/
-	if ( funName.contains("atomic_compare_exchange_") ) {
-		bool isExplicit = funName.contains("_explicit");
-
-		Value *Addr = IRB.CreatePointerCast(OrigPtr, PtrTy);
-		Value *CmpOperand = IRB.CreatePointerCast(parameters[1], PtrTy);
-		Value *NewOperand = IRB.CreateBitOrPointerCast(parameters[2], Ty);
-
-		Value *order_succ, *order_fail;
-		if (isExplicit) {
-			order_succ = IRB.CreateBitOrPointerCast(parameters[3], OrdTy);
-
-			if (parameters.size() > 4) {
-				order_fail = IRB.CreateBitOrPointerCast(parameters[4], OrdTy);
-			} else {
-				/* The failure order is not provided */
-				order_fail = order_succ;
-				ConstantInt * order_succ_cast = dyn_cast<ConstantInt>(order_succ);
-				int index = order_succ_cast->getSExtValue();
-
-				order_fail = ConstantInt::get(OrdTy,
-								AtomicCasFailureOrderIndex(index));
-			}
-		} else  {
-			order_succ = ConstantInt::get(OrdTy, 
-							(int) AtomicOrderingCABI::seq_cst);
-			order_fail = ConstantInt::get(OrdTy, 
-							(int) AtomicOrderingCABI::seq_cst);
-		}
-
-		Value *args[] = {Addr, CmpOperand, NewOperand, 
-							order_succ, order_fail, position};
-
-		if (!checkSignature(CDSAtomicCAS_V2[Idx], args))
-			return false;
-
-		Instruction* funcInst = CallInst::Create(CDSAtomicCAS_V2[Idx], args);
-		ReplaceInstWithInst(CI, funcInst);
-
-		return true;
-	} else if ( funName.contains("compare_exchange_strong") ||
-				funName.contains("compare_exchange_weak") ) {
-		Value *Addr = IRB.CreatePointerCast(OrigPtr, PtrTy);
-		Value *CmpOperand = IRB.CreatePointerCast(parameters[1], PtrTy);
-		Value *NewOperand = IRB.CreateBitOrPointerCast(parameters[2], Ty);
-
-		Value *order_succ, *order_fail;
-		order_succ = IRB.CreateBitOrPointerCast(parameters[3], OrdTy);
-
-		if (parameters.size() > 4) {
-			order_fail = IRB.CreateBitOrPointerCast(parameters[4], OrdTy);
-		} else {
-			/* The failure order is not provided */
-			order_fail = order_succ;
-			ConstantInt * order_succ_cast = dyn_cast<ConstantInt>(order_succ);
-			int index = order_succ_cast->getSExtValue();
-
-			order_fail = ConstantInt::get(OrdTy,
-							AtomicCasFailureOrderIndex(index));
-		}
-
-		Value *args[] = {Addr, CmpOperand, NewOperand, 
-							order_succ, order_fail, position};
-
-		if (!checkSignature(CDSAtomicCAS_V2[Idx], args))
-			return false;
-
-		Instruction* funcInst = CallInst::Create(CDSAtomicCAS_V2[Idx], args);
-		ReplaceInstWithInst(CI, funcInst);
-
-		return true;
-	}
-
-	return false;
-}
-
 int CDSPass::getMemoryAccessFuncIndex(Value *Addr,
 										const DataLayout &DL) {
 	Type *OrigPtrTy = Addr->getType();
@@ -1172,59 +820,6 @@ int CDSPass::getMemoryAccessFuncIndex(Value *Addr,
 		return -1;
 	}
 	return Idx;
-}
-
-bool CDSPass::instrumentLoops(Function &F)
-{
-	DominatorTree DT(F);
-	LoopInfo LI(DT);
-
-	SmallVector<Loop *, 4> Loops = LI.getLoopsInPreorder();
-	bool instrumented = false;
-
-	// Do a post-order traversal of the loops so that counter updates can be
-	// iteratively hoisted outside the loop nest.
-	for (auto *Loop : llvm::reverse(Loops)) {
-		bool instrument_loop = false;
-
-		// Iterator over loop blocks and search for atomics and volatiles
-		Loop::block_iterator it;
-		for (it = Loop->block_begin(); it != Loop->block_end(); it++) {
-			BasicBlock * block = *it;
-			for (auto &Inst : *block) {
-				if ( (&Inst)->isAtomic() ) {
-					instrument_loop = true;
-					break;
-				} else if (isAtomicCall(&Inst)) {
-					instrument_loop = true;
-					break;
-				} else if (isa<LoadInst>(Inst) || isa<StoreInst>(Inst)) {
-					LoadInst *LI = dyn_cast<LoadInst>(&Inst);
-					StoreInst *SI = dyn_cast<StoreInst>(&Inst);
-					bool isVolatile = ( LI ? LI->isVolatile() : SI->isVolatile() );
-
-					if (isVolatile) {
-						instrument_loop = true;
-						break;
-					}
-				}
-			}
-
-			if (instrument_loop)
-				break;
-		}
-
-		if (instrument_loop) {
-			// TODO: what to instrument?
-			errs() << "Function: " << F.getName() << "\n";
-			BasicBlock * header = Loop->getHeader();
-			header->dump();
-
-			instrumented = true;
-		}
-	}
-
-	return instrumented;
 }
 
 char CDSPass::ID = 0;
